@@ -13,11 +13,18 @@ class SettingsController extends Controller
 
     public function update(Settings $setting)
     {
-        $this->validate(request(), [
-           'slack_webhook_url' => 'url',
-        ]);
-        $setting->update(request()->all());
-
+        $val_rule = [];
+        if (request('slack_webhook_url')) {
+            $val_rule['slack_webhook_url'] = 'url';
+        }
+        if (request('notification_api_url')) {
+            $val_rule['notification_api_url'] = 'url';
+        }
+        $this->validate(request(), $val_rule);
+        $is_notification_enabled = request('notification_api_enabled') ? 1 : 0;
+        $requests = request()->all();
+        $requests['notification_api_enabled'] = $is_notification_enabled;
+        $setting->update($requests);
         return back();
     }
 }

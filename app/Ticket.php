@@ -2,60 +2,69 @@
 
 namespace App;
 
-use Carbon\Carbon;
 use App\Authenticatable\Admin;
-use App\Services\IssueCreator;
-use App\Events\TicketCommented;
-use App\Notifications\RateTicket;
 use App\Authenticatable\Assistant;
+use App\Events\TicketCommented;
 use App\Events\TicketStatusUpdated;
-use Illuminate\Support\Facades\App;
-use App\Notifications\TicketCreated;
+use App\Notifications\RateTicket;
 use App\Notifications\TicketAssigned;
+use App\Notifications\TicketCreated;
 use App\Notifications\TicketEscalated;
+use App\Services\IssueCreator;
 use App\Services\TicketLanguageDetector;
+use Carbon\Carbon;
 use Illuminate\Database\Eloquent\SoftDeletes;
+use Illuminate\Support\Facades\App;
+use App\Events\ApiNotificationEvent;
+use App\Events\TicketNotificationEvent;
+use App\Services\GitHubService;
 
 class Ticket extends BaseModel
 {
     use SoftDeletes, Taggable, Assignable, Subscribable, Rateable;
 
-    const STATUS_NEW     = 1;
-    const STATUS_OPEN    = 2;
+    const STATUS_NEW = 1;
+    const STATUS_OPEN = 2;
     const STATUS_PENDING = 3;
-    const STATUS_SOLVED  = 4;
-    const STATUS_CLOSED  = 5;
-    const STATUS_MERGED  = 6;
-    const STATUS_SPAM    = 7;
+    const STATUS_SOLVED = 4;
+    const STATUS_CLOSED = 5;
+    const STATUS_MERGED = 6;
+    const STATUS_SPAM = 7;
 
-    const PRIORITY_LOW       = 1;
-    const PRIORITY_NORMAL    = 2;
-    const PRIORITY_HIGH      = 3;
-    const PRIORITY_BLOCKER   = 4;
+    const PRIORITY_LOW = 1;
+    const PRIORITY_NORMAL = 2;
+    const PRIORITY_HIGH = 3;
+    const PRIORITY_BLOCKER = 4;
 
-    public static function createAndNotify($requester, $title, $body, $tags)
+    public static function createAndNotify($requester, $title, $body, $tags, $type = 0)
     {
         $requester = Requester::findOrCreate($requester['name'] ?? 'Unknown', $requester['email'] ?? null);
-        $ticket    = $requester->tickets()->create([
-            'title'        => substr($title, 0, 190),
-            'body'         => $body,
+        $ticket = $requester->tickets()->create([
+            'title' => substr($title, 0, 190),
+            'body' => $body,
             'public_token' => str_random(24),
+            'type_id' => $type,
         ])->attachTags($tags);
 
         tap(new TicketCreated($ticket), function ($newTicketNotification) use ($requester) {
             Admin::notifyAll($newTicketNotification);
             $requester->notify($newTicketNotification);
         });
+        if ($ticket->containTag('toolbox')) {
+            $github = new GitHubService();
+            $github->createIssue($ticket);
+        }
 
         return $ticket;
     }
 
-    public function updateWith($requester, $priority)
+    public function updateWith($requester, $priority, $type = 0)
     {
         $requester = Requester::findOrCreate($requester['name'] ?? 'Unknown', $requester['email'] ?? null);
         $this->update([
-            'priority'     => $priority,
+            'priority' => $priority,
             'requester_id' => $requester->id,
+            'type_id' => $type ?? $this->type_id,
         ]);
 
         return $this;
@@ -76,11 +85,19 @@ class Ticket extends BaseModel
         return $this->belongsTo(Requester::class);
     }
 
+    public function type()
+    {
+        return $this->belongsTo(Type::class);
+    }
+
     public function team()
     {
         return $this->belongsTo(Team::class);
     }
-
+    public function timeTracker()
+    {
+        return $this->hasOne(TimeTracker::class);
+    }
     public function comments()
     {
         return $this->commentsAndNotes()->where('private', false);
@@ -127,10 +144,14 @@ class Ticket extends BaseModel
         $previousStatus = $this->status;
         if ($newStatus && $newStatus != $previousStatus) {
             $this->updateStatus($newStatus);
-        } elseif (! $user && $this->status != static::STATUS_NEW) {
+        } elseif (!$user && $this->status != static::STATUS_NEW) {
             $this->updateStatus(static::STATUS_OPEN);
         } else {
             $this->touch();
+        }
+        if ($this->containTag('toolbox')) {
+            $github = new GitHubService();
+            $github->updateIssue($this);
         }
         event(new TicketStatusUpdated($this, $user, $previousStatus));
 
@@ -139,7 +160,7 @@ class Ticket extends BaseModel
 
     private function associateUserIfNecessary($user)
     {
-        if (! $this->user && $user) {
+        if (!$this->user && $user) {
             $this->user()->associate($user)->save();
         }
     }
@@ -156,23 +177,26 @@ class Ticket extends BaseModel
         }
         $previousStatus = $this->updateStatusFromComment($user, $newStatus);
         $this->associateUserIfNecessary($user);
-        if (! $body) {
+        if (!$body) {
             return;
         }
 
         $comment = $this->comments()->create([
-            'body'       => $body,
-            'user_id'    => $user ? $user->id : null,
+            'body' => $body,
+            'user_id' => $user ? $user->id : null,
             'new_status' => $newStatus ?: $this->status,
         ])->notifyNewComment();
         event(new TicketCommented($this, $comment, $previousStatus));
-
+        if ($this->containTag('toolbox')) {
+            $github = new GitHubService();
+            $github->addComment($comment);
+        }
         return $comment;
     }
 
     public function addNote($user, $body)
     {
-        if (! $body) {
+        if (!$body) {
             return null;
         }
         //if( ! $this->user && $user) { $this->user()->associate($user)->save(); }  //We don't want the notes to automatically assign the user
@@ -181,10 +205,10 @@ class Ticket extends BaseModel
         }
 
         return $this->comments()->create([
-            'body'       => $body,
-            'user_id'    => $user->id,
+            'body' => $body,
+            'user_id' => $user->id,
             'new_status' => $this->status,
-            'private'    => true,
+            'private' => true,
         ])->notifyNewNote();
     }
 
@@ -204,16 +228,29 @@ class Ticket extends BaseModel
     public function updateStatus($status)
     {
         $this->update(['status' => $status, 'updated_at' => Carbon::now()]);
-        TicketEvent::make($this, 'Status updated: '.$this->statusName());
-        if ($status == Ticket::STATUS_SOLVED && ! $this->rating && config('handesk.sendRatingEmail')) {
+
+        if (isset($this->user->email)) {
+            $this-> requester;
+            $data['data'] = json_encode($this);
+            $data['type'] = 'ticket';
+            $data['message'] = 'this is update tickets';
+            $data['username']= $this->user->email;
+            event(new ApiNotificationEvent($data));
+        }
+        TicketEvent::make($this, 'Status updated: ' . $this->statusName());
+        if ($status == Ticket::STATUS_SOLVED && !$this->rating && config('handesk.sendRatingEmail')) {
             $this->requester->notify((new RateTicket($this))->delay(now()->addMinutes(60)));
+        }
+        if ($this->containTag('toolbox')) {
+            $github = new GitHubService();
+            $github->updateIssue($this);
         }
     }
 
     public function updatePriority($priority)
     {
         $this->update(['priority' => $priority, 'updated_at' => Carbon::now()]);
-        TicketEvent::make($this, 'Priority updated: '.$this->priorityName());
+        TicketEvent::make($this, 'Priority updated: ' . $this->priorityName());
     }
 
     public function setLevel($level)
@@ -249,19 +286,36 @@ class Ticket extends BaseModel
 
     public function canBeEdited()
     {
-        return ! in_array($this->status, [self::STATUS_CLOSED, self::STATUS_MERGED]);
+        return !in_array($this->status, [self::STATUS_CLOSED, self::STATUS_MERGED]);
+    }
+
+    public function canTrackTime()
+    {
+        $type = $this->type;
+        if (!isset($type->id)) {
+            return false;
+        } else {
+            return $type->is_trackable;
+        }
     }
 
     public static function statusNameFor($status)
     {
         switch ($status) {
-            case static::STATUS_NEW: return 'new';
-            case static::STATUS_OPEN: return 'open';
-            case static::STATUS_PENDING: return 'pending';
-            case static::STATUS_SOLVED: return 'solved';
-            case static::STATUS_CLOSED: return 'closed';
-            case static::STATUS_MERGED: return 'merged';
-            case static::STATUS_SPAM: return 'spam';
+            case static::STATUS_NEW:
+                return 'new';
+            case static::STATUS_OPEN:
+                return 'open';
+            case static::STATUS_PENDING:
+                return 'pending';
+            case static::STATUS_SOLVED:
+                return 'solved';
+            case static::STATUS_CLOSED:
+                return 'closed';
+            case static::STATUS_MERGED:
+                return 'merged';
+            case static::STATUS_SPAM:
+                return 'spam';
         }
     }
 
@@ -273,10 +327,14 @@ class Ticket extends BaseModel
     public static function priorityNameFor($priority)
     {
         switch ($priority) {
-            case static::PRIORITY_LOW: return 'low';
-            case static::PRIORITY_NORMAL: return 'normal';
-            case static::PRIORITY_HIGH: return 'high';
-            case static::PRIORITY_BLOCKER: return 'blocker';
+            case static::PRIORITY_LOW:
+                return 'low';
+            case static::PRIORITY_NORMAL:
+                return 'normal';
+            case static::PRIORITY_HIGH:
+                return 'high';
+            case static::PRIORITY_BLOCKER:
+                return 'blocker';
         }
     }
 
@@ -301,9 +359,9 @@ class Ticket extends BaseModel
     public function createIssue(IssueCreator $issueCreator, $repository)
     {
         $issue = $issueCreator->createIssue(
-                $repository,
-                $this->title,
-                'Issue from ticket: '.route('tickets.show', $this)."   \n\r".$this->body
+            $repository,
+            $this->title,
+            'Issue from ticket: ' . route('tickets.show', $this) . "   \n\r" . $this->body
         );
         $this->addNote(auth()->user(), "Issue created https://bitbucket.org{$issue->resource_uri} with id #{$issue->local_id}");
         //TODO: Notify somebody? if so, create the test
@@ -322,7 +380,7 @@ class Ticket extends BaseModel
     public function getIssueId()
     {
         $issueNote = $this->findIssueNote();
-        if (! $issueNote) {
+        if (!$issueNote) {
             return null;
         }
 
@@ -332,11 +390,11 @@ class Ticket extends BaseModel
     public function issueUrl()
     {
         $issueNote = $this->findIssueNote();
-        if (! $issueNote) {
+        if (!$issueNote) {
             return null;
         }
-        $start  = strpos($issueNote->body, 'https://');
-        $end    = strpos($issueNote->body, 'with id');
+        $start = strpos($issueNote->body, 'https://');
+        $end = strpos($issueNote->body, 'with id');
         $apiUrl = substr($issueNote->body, $start, $end - $start);
 
         return str_replace('api.', '', str_replace('1.0/repositories/', '', $apiUrl));
@@ -346,8 +404,8 @@ class Ticket extends BaseModel
     {
         $idea = Idea::create([
             'requester_id' => $this->requester_id,
-            'title'        => $this->title,
-            'body'         => $this->body,
+            'title' => $this->title,
+            'body' => $this->body,
         ])->attachTags(['ticket']);
         TicketEvent::make($this, "Idea created #{$idea->id}");
         App::setLocale((new TicketLanguageDetector($this))->detect());
@@ -356,10 +414,21 @@ class Ticket extends BaseModel
         return $idea;
     }
 
+    public function containTag($tag)
+    {
+        $tags = $this->tags;
+        foreach ($tags as $key => $t) {
+            if ($tag == strtolower($t->name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public function getIdeaId()
     {
         $issueEvent = $this->events()->where('body', 'like', '%Idea created%')->first();
-        if (! $issueEvent) {
+        if (!$issueEvent) {
             return null;
         }
 

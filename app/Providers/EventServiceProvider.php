@@ -2,8 +2,8 @@
 
 namespace App\Providers;
 
-use Illuminate\Support\Facades\Event;
 use Illuminate\Foundation\Support\Providers\EventServiceProvider as ServiceProvider;
+use Illuminate\Support\Facades\Event;
 
 class EventServiceProvider extends ServiceProvider
 {
@@ -24,6 +24,16 @@ class EventServiceProvider extends ServiceProvider
         ],
         'App\Events\TicketRated' => [
             'App\Listeners\UpdateRatedKpi',
+        ],
+        'App\Events\ApiNotificationEvent' => [
+            'App\Listeners\SendApiNotificaton',
+        ],
+        'App\Events\TicketNotificationEvent' => [
+            'App\Listeners\SendNotificationTicket',
+        ],
+        \SocialiteProviders\Manager\SocialiteWasCalled::class => [
+                // add your listeners (aka providers) here
+                'SocialiteProviders\\Azure\\AzureExtendSocialite@handle',
         ],
     ];
 

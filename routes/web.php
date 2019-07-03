@@ -9,11 +9,13 @@
 | routes are loaded by the RouteServiceProvider within a group which
 | contains the "web" middleware group. Now create something great!
 |
-*/
+ */
 
 Route::get('/', 'HomeController@index');
 
 Auth::routes();
+Route::get('/azure/login', 'Auth\LoginController@redirectToAzureProvider')->name('azure.sign.in');
+Route::get('/login/microsoft/callback', 'Auth\LoginController@handleAzureProviderCallback');
 
 Route::group(['prefix' => 'requester'], function () {
     Route::get('tickets/{token}', 'RequesterTicketsController@show')->name('requester.tickets.show');
@@ -36,6 +38,7 @@ Route::group(['middleware' => ['auth', 'userLocale']], function () {
     Route::post('tickets/{ticket}/comments', 'CommentsController@store')->name('comments.store');
     Route::resource('tickets/{ticket}/tags', 'TicketsTagsController', ['only' => ['store', 'destroy'], 'as' => 'tickets']);
     Route::post('tickets/{ticket}/reopen', 'TicketsController@reopen')->name('tickets.reopen');
+    Route::get('tickets/{ticket}/update-time-tracker', 'TicketsController@updateTimeTracker')->name('tickets.time.tracker.update');
 
     Route::post('tickets/{ticket}/escalate', 'TicketsEscalateController@store')->name('tickets.escalate.store');
     Route::delete('tickets/{ticket}/escalate', 'TicketsEscalateController@destroy')->name('tickets.escalate.destroy');
@@ -66,8 +69,11 @@ Route::group(['middleware' => ['auth', 'userLocale']], function () {
         Route::resource('users', 'UsersController', ['only' => ['index', 'destroy']]);
         Route::get('users/{user}/impersonate', 'UsersController@impersonate')->name('users.impersonate');
         Route::resource('settings', 'SettingsController', ['only' => ['edit', 'update']]);
+
+        Route::resource('types', 'TypesController');
     });
 
     Route::get('reports', 'ReportsController@index')->name('reports.index');
     Route::post('thrust/{resourceName}/actions', 'ThrustActionsController@perform')->name('thrust.actions.perform');
+    Route::get('thrust/{resourceName}/{id}/toggle/{field}', 'ThrustActionsController@toggle')->name('thrust.toggle');
 });
